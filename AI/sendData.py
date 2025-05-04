@@ -6,8 +6,9 @@ from deepface import DeepFace
 from pymongo.mongo_client import MongoClient
 from datetime import datetime
 import requests
+import numpy as np
+from mtcnn import MTCNN
 
-# ================== UBIDOTS CONFIG ==================
 UBIDOTS_TOKEN = "BBUS-NkkUJPZOo48KrOvlHj7b1RnCTkWBZZ"
 DEVICE_NAME = "esp32_cam"
 EMOTION_MAP = {
@@ -46,7 +47,6 @@ def kirim_emosi_ke_ubidots(emotion):
     except Exception as e:
         print(f"[UBIDOTS] Error: {e}")
 
-# ================== MONGODB CONFIG ==================
 MONGO_URI = "mongodb+srv://bintangananda405:RF7TIDmpByWYtpHq@moodhistory.sguzz0x.mongodb.net/?retryWrites=true&w=majority&appName=moodHistory"
 client = MongoClient(MONGO_URI)
 try:
@@ -72,8 +72,7 @@ def kirim_emosi_ke_mongodb(emotion, timestamp):
     except Exception as e:
         print(f"[MongoDB] Gagal simpan emosi: {e}")
 
-# ================== VIDEO FROM LOCAL WEBCAM ==================
-ESP32_URL = "http://192.168.51.48:81/stream"
+ESP32_URL = 0 # Trial dengan webcam
 cap = cv2.VideoCapture(ESP32_URL)
 if not cap.isOpened():
     print("❌ Tidak bisa membuka webcam.")
@@ -81,9 +80,19 @@ if not cap.isOpened():
 
 print("✅ Webcam berhasil dibuka.")
 
+detector = MTCNN()
+
 emotion_history = deque(maxlen=30)
 last_sent_time = 0
-interval_send = 5  # detik
+interval_send = 5
+
+def preprocess_image(image):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    enhanced = cv2.convertScaleAbs(image, alpha=1.5, beta=20)
+    sharpen_kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+    sharpened = cv2.filter2D(enhanced, -1, sharpen_kernel)
+    resized = cv2.resize(sharpened, (224, 224))
+    return resized
 
 try:
     while True:
@@ -92,13 +101,20 @@ try:
             print("⚠️ Tidak bisa membaca frame dari webcam.")
             break
 
-        try:
-            result = DeepFace.analyze(frame, actions=['emotion'], enforce_detection=False)
-            emotion_scores = result[0]['emotion']
-            emotion_history.append(emotion_scores)
-        except Exception as e:
-            print(f"[DeepFace] Gagal deteksi: {e}")
-            continue
+        faces = detector.detect_faces(frame)
+        for face in faces:
+            x, y, w, h = face['box']
+            face_crop = frame[y:y+h, x:x+w]
+
+            preprocessed_face = preprocess_image(face_crop)
+
+            try:
+                result = DeepFace.analyze(preprocessed_face, actions=['emotion'], enforce_detection=False)
+                emotion_scores = result[0]['emotion']
+                emotion_history.append(emotion_scores)
+            except Exception as e:
+                print(f"[DeepFace] Gagal deteksi: {e}")
+                continue
 
         if emotion_history:
             avg_emotions = {
@@ -109,9 +125,12 @@ try:
         else:
             dominant_emotion = 'unknown'
 
-        # Tampilkan emosi di atas frame
-        cv2.putText(frame, f"", (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+        for face in faces:
+            x, y, w, h = face['box']
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+        cv2.putText(frame, f"{dominant_emotion}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2, cv2.LINE_AA)
 
         cv2.imshow('Deteksi Emosi Webcam', frame)
 
@@ -121,11 +140,10 @@ try:
             kirim_emosi_ke_mongodb(dominant_emotion, timestamp_now)
             last_sent_time = time.time()
 
-        # Tekan 'q' untuk keluar
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-        time.sleep(0.2)  # diperlambat agar tidak terlalu cepat
+        time.sleep(0.2)
 
 except KeyboardInterrupt:
     print("\n⏹️ Proses dihentikan oleh user.")
